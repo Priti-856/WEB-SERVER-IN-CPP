@@ -295,6 +295,8 @@ std::string full_response; // Buffer to store complete response for caching
               client_alive = false;
                 break;
             }
+            total_sent += sent;
+        }
           if (!client_alive)
             break;
     }
@@ -318,7 +320,7 @@ public:
     std::mutex queue_mutex;
     std::condition_variable cv;
     bool stop;
-
+    }
     ThreadPool(int num_threads)
     {
         this->stop = false;
