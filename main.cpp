@@ -199,13 +199,65 @@
             std::cerr << "Failed to connect to any resolved address\n";
             close(server_accept);
             freeaddrinfo(res);
-            continue;
+            return;
         }
 
         std::cout << "Connected to remote server!" << std::endl;
 
         freeaddrinfo(res);
 
+          // 7. Send response
+    std::string forward_request = method + " " + path + " " + version + "\r\n";
+
+    // Append rest of headers (skip first line)
+    std::size_t first_line_end = request.find("\r\n");
+    forward_request += request.substr(first_line_end + 2);
+
+    // Send to remote
+    send(remote_socket, forward_request.c_str(), forward_request.size(), 0);
+    bool client_alive = true;
+
+       while (true)
+    {
+        ssize_t bytes = read(remote_socket, buffer, sizeof(buffer));
+        if (bytes <= 0)
+            break;
+
+       ssize_t total_sent = 0;
+        while (total_sent < bytes)
+        {
+            ssize_t sent = send(client_fd, buffer + total_sent, bytes - total_sent, 0);
+            if (sent <= 0){
+              client_alive = false;
+                break;
+            }
+          if (!client_alive)
+            break;
+    }
+   close(remote_socket);
+    close(client_fd);
+}
+      class ThreadPool
+{
+public:
+    std::vector<std::thread> workers;
+    std::queue<int> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable cv;
+    bool stop;
+
+    ThreadPool(int num_threads)
+    {
+        this->stop = false;
+        for (int i = 0; i < num_threads; ++i)
+        {
+            workers.emplace_back([this]()
+                                 { worker_run(); });
+        }
+      }
+    void worker_run()
+    {
+        while (true){
       
         
         close(server_accept);
