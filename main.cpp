@@ -258,10 +258,83 @@ public:
     void worker_run()
     {
         while (true){
-      
-        
-        close(server_accept);
+      std::unique_lock<std::mutex> lock(queue_mutex);
+            while (tasks.empty() && stop == false)
+            {
+                cv.wait(lock);
+            }
+            if (stop == true and tasks.empty())
+            {
+                return;
+            }
+            int fd = tasks.front();
+            tasks.pop();
+            lock.unlock();
+            handle_client(fd);
+        }
+    }
+    void enqueue(int fd)
+    {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            tasks.push(fd);
+        }
+              cv.notify_one();
     }
 
+    ~ThreadPool()
+    {
+        {
+           std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        cv.notify_all();
+
+        for (auto &t : workers)
+            t.join();
+    }
+};
+      int main()
+{
+    std::cout << "Main Function starting" << std::endl;
+
+    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket < 0)
+    {
+        std::cout << "Unable to create the socket";
+        exit(1);
+    }
+    int opt = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY; // Accept any IP
+    address.sin_port = htons(8080);   //port 8080
+    if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
+    {
+        std::cout << "Unable to bind";
+    }
+  int server_listen = listen(server_socket, MAX_CLIENTS);
+    if (server_listen < 0)
+    {
+        std::cout << "Unale to listen";
+    }
+  ThreadPool thread_pool(5);
+    while (true)
+    {
+      sockaddr_in client_address{};
+        socklen_t client_len = sizeof(client_address);
+
+        int server_accept = accept(
+            server_socket,
+            (struct sockaddr *)&client_address,
+            (socklen_t *)&client_len);
+        if (server_accept < 0)
+            continue;
+
+        thread_pool.enqueue(server_accept);
+    }
+        
+       
     close(server_socket);
-}
+
