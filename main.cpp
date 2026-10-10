@@ -111,6 +111,16 @@
         std::cout << "Host: " << hostname << std::endl;
         std::cout << "Port: " << port << std::endl;
 
+  
+     if (path.find("http://") == 0)
+        {
+            std::size_t pos = path.find("/", 7);
+            if (pos != std::string::npos)
+                path = path.substr(pos);
+            else
+                path = "/";
+        }
+
 
             std::string ip_address;
 
@@ -123,7 +133,7 @@
         if (status != 0)
         {
             std::cerr << "getaddrinfo error: " << gai_strerror(status) << std::endl;
-            break;
+            continue;
         }
         char ipstr[INET6_ADDRSTRLEN];
 
@@ -150,20 +160,35 @@
 
             break; // take first valid one
         }
+      int remote_socket = -1;
+        addrinfo *p;
+
+        for (p = res; p != nullptr; p = p->ai_next)
+        {
+            remote_socket = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (remote_socket < 0)
+                continue;
+
+            if (connect(remote_socket, p->ai_addr, p->ai_addrlen) == 0)
+                break; // success
+
+            close(remote_socket);
+        }
+
+        if (p == nullptr)
+        {
+            std::cerr << "Failed to connect to any resolved address\n";
+            close(server_accept);
+            freeaddrinfo(res);
+            continue;
+        }
+
+        std::cout << "Connected to remote server!" << std::endl;
+
+        freeaddrinfo(res);
 
       
-        // 7. Send response
-        std::string body = "Hello from server";
-
-        std::string http_response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: " +
-            std::to_string(body.size()) + "\r\n"
-                                          "Connection: close\r\n"
-                                          "\r\n" +
-            body;
-        send(server_accept, http_response.c_str(), http_response.size(), 0);
+        
         close(server_accept);
     }
 
