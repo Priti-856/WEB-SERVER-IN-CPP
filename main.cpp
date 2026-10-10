@@ -16,7 +16,7 @@
 #include <utility>
 
 
-#define MAX_CLIENTS 
+#define MAX_CLIENTS 3
 #define CACHE_CAPACITY 10
 
 // Thread-safe LRU Cache
@@ -138,14 +138,7 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
     std::size_t host_pos = request.find("Host:");
     std::string hostname;
     std::string port;
-    if (host_pos != std::string::npos)
-    {
-        std::cout << "Message from client: " << request << std::endl;
-
-           std::string host_header;
-        std::size_t host_pos = request.find("Host:");
-        std::string hostname;
-        std::string port;
+    
         if (host_pos != std::string::npos)
         {
             std::size_t start = host_pos + 6;
@@ -213,7 +206,7 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
         if (status != 0)
         {
             std::cerr << "getaddrinfo error: " << gai_strerror(status) << std::endl;
-            continue;
+            return;
         }
         char ipstr[INET6_ADDRSTRLEN];
 
@@ -258,7 +251,7 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
         if (p == nullptr)
         {
             std::cerr << "Failed to connect to any resolved address\n";
-            close(server_accept);
+            close(client_fd);
             freeaddrinfo(res);
             return;
         }
@@ -320,7 +313,7 @@ public:
     std::mutex queue_mutex;
     std::condition_variable cv;
     bool stop;
-    }
+    
     ThreadPool(int num_threads)
     {
         this->stop = false;
