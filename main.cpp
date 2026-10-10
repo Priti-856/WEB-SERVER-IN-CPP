@@ -6,29 +6,48 @@
 #include <string>
 #include<netdb.h>
 #include<arpa/inet.h>
+#include <queue>
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
 
 
-#define Max_Clients 3
+#define MAX_CLIENTS 3
   
-  int main()
+ void handle_client(int client_fd)
 {
-    std::cout << "Main Function starting";
+    char buffer[1024] = {0};
+    std::string request;
 
-    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket < 0)
+   while(true)
     {
-        std::cout << "Unable to create the socket";
-        exit(1);
+       auto request_data = read(client_fd, buffer, sizeof(buffer));
+        if (request_data < 0)
+        {
+            std::cout << "Error in read" << std::endl;
+            break;
+        }
+
+        if (request_data == 0)
+        {
+            // client closed connection
+            break;
+        }
+
+        request.append(buffer, request_data);
+        if (request.find("\r\n\r\n") != std::string::npos)
+        {
+            break;
+        }
     }
-    int opt = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    std::cout << "Message from client: " << request << std::endl;     
 
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY; // Accept any IP
-    address.sin_port = htons(8080);       // Port 8080
-
-    if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
+       std::string host_header;
+    std::size_t host_pos = request.find("Host:");
+    std::string hostname;
+    std::string port;
+    if (host_pos != std::string::npos)
     {
         std::cout << "Unable to bind";
     }
