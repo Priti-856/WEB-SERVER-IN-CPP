@@ -11,9 +11,100 @@
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <list>
+#include <unordered_map>
+#include <utility>
 
 
-#define MAX_CLIENTS 3
+#define MAX_CLIENTS 
+#define CACHE_CAPACITY 10
+
+// Thread-safe LRU Cache
+class LRUCache
+{
+private:
+    size_t capacity;
+    std::list<std::pair<std::string, std::string>> cache_list; // (key, value) pairs
+    std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> cache_map;
+    mutable std::mutex cache_mutex;
+
+public:
+    LRUCache(size_t cap) : capacity(cap) {}
+
+    // Get value from cache, returns empty string if not found
+    std::string get(const std::string &key)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cache_map.find(key);
+        if (it == cache_map.end())
+        {
+            return ""; // Not found
+        }
+
+        // Move accessed item to front (most recently used)
+        cache_list.splice(cache_list.begin(), cache_list, it->second);
+        return it->second->second;
+    }
+
+    // Check if key exists in cache
+    bool contains(const std::string &key)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        return cache_map.find(key) != cache_map.end();
+    }
+
+    // Put value into cache
+    void put(const std::string &key, const std::string &value)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+
+        auto it = cache_map.find(key);
+        if (it != cache_map.end())
+        {
+            // Key exists, update value and move to front
+            it->second->second = value;
+            cache_list.splice(cache_list.begin(), cache_list, it->second);
+            return;
+        }
+
+        // Evict least recently used if at capacity
+        if (cache_list.size() >= capacity)
+        {
+            auto &last = cache_list.back();
+            cache_map.erase(last.first);
+            cache_list.pop_back();
+        }
+
+        // Insert new item at front
+        cache_list.emplace_front(key, value);
+        cache_map[key] = cache_list.begin();
+    }
+
+    size_t size() const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        return cache_list.size();
+    }
+
+    // Clear the cache
+    void clear()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache_list.clear();
+        cache_map.clear();
+    }
+};
+
+// Global LRU cache instance
+LRUCache response_cache(CACHE_CAPACITY);
+
+// Helper to check if response is cacheable (only cache GET requests with 200 OK)
+bool is_cacheable_response(const std::string &method, const std::string &response)
+{
+    if (method != "GET")
+        return false;
+    return true;
+}
   
  void handle_client(int client_fd)
 {
@@ -49,52 +140,6 @@
     std::string port;
     if (host_pos != std::string::npos)
     {
-        std::cout << "Unable to bind";
-    }
-
-    int server_listen = listen(server_socket, Max_Clients);
-    if (server_listen < 0)
-    {
-        std::cout << "Unale to listen";
-    }
-
-    while (true)
-    {
-        //char buffer[1024] = {0};
-
-        sockaddr_in client_address{};
-        socklen_t client_len = sizeof(client_address);
-
-        int server_accept = accept(
-            server_socket,
-            (struct sockaddr *)&client_address,
-            (socklen_t *)&client_len);
-
-        char buffer[1024] = {0};
-        std::string request;
-
-        while (true)
-        {
-            auto request_data = read(server_accept, buffer, sizeof(buffer));
-            if (request_data < 0)
-            {
-                std::cout << "Read in read" << std::endl;
-                break;
-            }
-
-            if (request_data == 0)
-            {
-                // client closed connection
-                break;
-            }
-
-            request.append(buffer, request_data);
-            if (request.find("\r\n\r\n") != std::string::npos)
-            {
-                break;
-            }
-        }
-
         std::cout << "Message from client: " << request << std::endl;
 
            std::string host_header;
@@ -139,6 +184,22 @@
             else
                 path = "/";
         }
+// Generate cache key from hostname + path
+    std::string cache_key = hostname + ":" + port + path;
+
+    // Check cache for GET requests
+    if (method == "GET")
+    {
+        std::string cached_response = response_cache.get(cache_key);
+        if (!cached_response.empty())
+        {
+            std::cout << "Cache HIT for: " << cache_key << std::endl;
+            send(client_fd, cached_response.c_str(), cached_response.size(), 0);
+            close(client_fd);
+            return;
+        }
+        std::cout << "Cache MISS for: " << cache_key << std::endl;
+    }
 
 
             std::string ip_address;
@@ -216,6 +277,7 @@
     // Send to remote
     send(remote_socket, forward_request.c_str(), forward_request.size(), 0);
     bool client_alive = true;
+std::string full_response; // Buffer to store complete response for caching
 
        while (true)
     {
@@ -223,6 +285,8 @@
         if (bytes <= 0)
             break;
 
+      full_response.append(buffer, bytes);
+      
        ssize_t total_sent = 0;
         while (total_sent < bytes)
         {
@@ -234,6 +298,15 @@
           if (!client_alive)
             break;
     }
+      
+    // Cache the response if it's cacheable
+    if (client_alive && is_cacheable_response(method, full_response))
+    {
+        response_cache.put(cache_key, full_response);
+        std::cout << "Cached response for: " << cache_key << " (size: " << full_response.size() << " bytes)" << std::endl;
+    }
+
+      
    close(remote_socket);
     close(client_fd);
 }
@@ -337,4 +410,4 @@ public:
         
        
     close(server_socket);
-
+}
