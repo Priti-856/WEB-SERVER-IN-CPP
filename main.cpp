@@ -16,6 +16,8 @@
 #include <utility>
 #include<sstream>
 
+using namespace std;
+
 #define MAX_CLIENTS 3
 #define CACHE_CAPACITY 10
 
