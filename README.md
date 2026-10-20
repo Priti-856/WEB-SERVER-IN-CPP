@@ -86,10 +86,10 @@ Open your terminal and run the appropriate command for your OS:
 
 * **On macOS:**
   ```bash
-  g++ -std=c++11 proxy_server.cpp -o proxy_server
+  g++ -std=c++11 main.cpp -o main
   ```
 
 * **On Linux:**
   ```bash
-  g++ -std=c++11 -pthread proxy_server.cpp -o proxy_server
+  g++ -std=c++11 -pthread main.cpp -o main
   ```
