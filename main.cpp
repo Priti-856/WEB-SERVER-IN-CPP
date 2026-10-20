@@ -14,7 +14,7 @@
 #include <list>
 #include <unordered_map>
 #include <utility>
-
+#include<sstream>
 
 #define MAX_CLIENTS 3
 #define CACHE_CAPACITY 10
@@ -24,15 +24,15 @@ class LRUCache
 {
 private:
     size_t capacity;
-    std::list<std::pair<std::string, std::string>> cache_list; // (key, value) pairs
-    std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> cache_map;
-    mutable std::mutex cache_mutex;
+    list<pair<string, string>> cache_list; // (key, value) pairs
+    unordered_map<string, list<pair<string, string>>::iterator> cache_map;
+    mutable mutex cache_mutex;
 
 public:
     LRUCache(size_t cap) : capacity(cap) {}
 
     // Get value from cache, returns empty string if not found
-    std::string get(const std::string &key)
+    string get(const string &key)
     {
         std::lock_guard<std::mutex> lock(cache_mutex);
         auto it = cache_map.find(key);
@@ -56,7 +56,7 @@ public:
     // Put value into cache
     void put(const std::string &key, const std::string &value)
     {
-        std::lock_guard<std::mutex> lock(cache_mutex);
+        lock_guard<std::mutex> lock(cache_mutex);
 
         auto it = cache_map.find(key);
         if (it != cache_map.end())
@@ -99,7 +99,7 @@ public:
 LRUCache response_cache(CACHE_CAPACITY);
 
 // Helper to check if response is cacheable (only cache GET requests with 200 OK)
-bool is_cacheable_response(const std::string &method, const std::string &response)
+bool is_cacheable_response(const string &method, const string &response)
 {
     if (method != "GET")
         return false;
@@ -109,14 +109,14 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
  void handle_client(int client_fd)
 {
     char buffer[1024] = {0};
-    std::string request;
+    string request;
 
    while(true)
     {
        auto request_data = read(client_fd, buffer, sizeof(buffer));
         if (request_data < 0)
         {
-            std::cout << "Error in read" << std::endl;
+            cout << "Error in read" << std::endl;
             break;
         }
 
@@ -127,25 +127,25 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
         }
 
         request.append(buffer, request_data);
-        if (request.find("\r\n\r\n") != std::string::npos)
+        if (request.find("\r\n\r\n") != string::npos)
         {
             break;
         }
     }
-    std::cout << "Message from client: " << request << std::endl;     
+    cout << "Message from client: " << request << endl;     
 
-       std::string host_header;
-    std::size_t host_pos = request.find("Host:");
-    std::string hostname;
-    std::string port;
+       string host_header;
+    size_t host_pos = request.find("Host:");
+    string hostname;
+    string port;
     
-        if (host_pos != std::string::npos)
+        if (host_pos != string::npos)
         {
-            std::size_t start = host_pos + 6;
-            std::size_t end = request.find("\r\n", start);
+            size_t start = host_pos + 6;
+            size_t end = request.find("\r\n", start);
             host_header = request.substr(start, end - start);
             auto spilt_index = host_header.find(":");
-            if (spilt_index == std::string::npos)
+            if (spilt_index == string::npos)
             {
                 hostname = host_header;
                 port = "80";
@@ -157,22 +157,22 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
             }
         }
 
-        std::istringstream stream(request);
-        std::string method, path, version;
+        istringstream stream(request);
+        string method, path, version;
 
         stream >> method >> path >> version;
-        std::cout << "Method: " << method << std::endl;
-        std::cout << "Path: " << path << std::endl;
-        std::cout << "Version: " << version << std::endl;
-        std::cout << "Host Header: " << host_header << std::endl;
-        std::cout << "Host: " << hostname << std::endl;
-        std::cout << "Port: " << port << std::endl;
+        cout << "Method: " << method << std::endl;
+        cout << "Path: " << path << std::endl;
+        cout << "Version: " << version << std::endl;
+        cout << "Host Header: " << host_header << std::endl;
+        cout << "Host: " << hostname << std::endl;
+        cout << "Port: " << port << std::endl;
 
   
      if (path.find("http://") == 0)
         {
-            std::size_t pos = path.find("/", 7);
-            if (pos != std::string::npos)
+            size_t pos = path.find("/", 7);
+            if (pos != string::npos)
                 path = path.substr(pos);
             else
                 path = "/";
@@ -183,19 +183,19 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
     // Check cache for GET requests
     if (method == "GET")
     {
-        std::string cached_response = response_cache.get(cache_key);
+        string cached_response = response_cache.get(cache_key);
         if (!cached_response.empty())
         {
-            std::cout << "Cache HIT for: " << cache_key << std::endl;
+            cout << "Cache HIT for: " << cache_key << endl;
             send(client_fd, cached_response.c_str(), cached_response.size(), 0);
             close(client_fd);
             return;
         }
-        std::cout << "Cache MISS for: " << cache_key << std::endl;
+        cout << "Cache MISS for: " << cache_key << endl;
     }
 
 
-            std::string ip_address;
+            string ip_address;
 
         addrinfo hints{}, *res;
         hints.ai_family = AF_UNSPEC;     // IPv4 or IPv6
@@ -205,7 +205,7 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
 
         if (status != 0)
         {
-            std::cerr << "getaddrinfo error: " << gai_strerror(status) << std::endl;
+            cerr << "getaddrinfo error: " << gai_strerror(status) << endl;
             return;
         }
         char ipstr[INET6_ADDRSTRLEN];
@@ -229,7 +229,7 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
             inet_ntop(p->ai_family, addr, ipstr, sizeof ipstr);
 
             ip_address = ipstr;
-            std::cout << "Resolved IP: " << ip_address << std::endl;
+            cout << "Resolved IP: " << ip_address << endl;
 
             break; // take first valid one
         }
@@ -256,21 +256,21 @@ bool is_cacheable_response(const std::string &method, const std::string &respons
             return;
         }
 
-        std::cout << "Connected to remote server!" << std::endl;
+        std::cout << "Connected to remote server!" << endl;
 
         freeaddrinfo(res);
 
           // 7. Send response
-    std::string forward_request = method + " " + path + " " + version + "\r\n";
+   string forward_request = method + " " + path + " " + version + "\r\n";
 
     // Append rest of headers (skip first line)
-    std::size_t first_line_end = request.find("\r\n");
+   size_t first_line_end = request.find("\r\n");
     forward_request += request.substr(first_line_end + 2);
 
     // Send to remote
     send(remote_socket, forward_request.c_str(), forward_request.size(), 0);
     bool client_alive = true;
-std::string full_response; // Buffer to store complete response for caching
+string full_response; // Buffer to store complete response for caching
 
        while (true)
     {
@@ -298,7 +298,7 @@ std::string full_response; // Buffer to store complete response for caching
     if (client_alive && is_cacheable_response(method, full_response))
     {
         response_cache.put(cache_key, full_response);
-        std::cout << "Cached response for: " << cache_key << " (size: " << full_response.size() << " bytes)" << std::endl;
+       cout << "Cached response for: " << cache_key << " (size: " << full_response.size() << " bytes)" <<endl;
     }
 
       
@@ -308,10 +308,10 @@ std::string full_response; // Buffer to store complete response for caching
       class ThreadPool
 {
 public:
-    std::vector<std::thread> workers;
-    std::queue<int> tasks;
-    std::mutex queue_mutex;
-    std::condition_variable cv;
+    vector<std::thread> workers;
+    queue<int> tasks;
+    mutex queue_mutex;
+   condition_variable cv;
     bool stop;
     
     ThreadPool(int num_threads)
@@ -326,7 +326,7 @@ public:
     void worker_run()
     {
         while (true){
-      std::unique_lock<std::mutex> lock(queue_mutex);
+      unique_lock<mutex> lock(queue_mutex);
             while (tasks.empty() && stop == false)
             {
                 cv.wait(lock);
@@ -344,7 +344,7 @@ public:
     void enqueue(int fd)
     {
         {
-            std::unique_lock<std::mutex> lock(queue_mutex);
+            unique_lock<mutex> lock(queue_mutex);
             tasks.push(fd);
         }
               cv.notify_one();
@@ -353,7 +353,7 @@ public:
     ~ThreadPool()
     {
         {
-           std::unique_lock<std::mutex> lock(queue_mutex);
+           unique_lock<mutex> lock(queue_mutex);
             stop = true;
         }
         cv.notify_all();
@@ -364,12 +364,12 @@ public:
 };
       int main()
 {
-    std::cout << "Main Function starting" << std::endl;
+    cout << "Main Function starting" << endl;
 
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0)
     {
-        std::cout << "Unable to create the socket";
+        cout << "Unable to create the socket";
         exit(1);
     }
     int opt = 1;
@@ -380,12 +380,12 @@ public:
     address.sin_port = htons(8080);   //port 8080
     if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
     {
-        std::cout << "Unable to bind";
+        cout << "Unable to bind";
     }
   int server_listen = listen(server_socket, MAX_CLIENTS);
     if (server_listen < 0)
     {
-        std::cout << "Unale to listen";
+        cout << "Unale to listen";
     }
   ThreadPool thread_pool(5);
     while (true)
