@@ -1,410 +1,434 @@
-#include <sys/socket.h> // For socket functions
-#include <netinet/in.h> // For sockaddr_in
-#include <cstdlib>      // For exit() and EXIT_FAILURE
-#include <iostream>     // For cout
-#include <unistd.h>     // For read
-#include <string>
-#include<netdb.h>
-#include<arpa/inet.h>
-#include <queue>
-#include <thread>
-#include <vector>
-#include <mutex>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <condition_variable>
+#include <cctype>
+#include <iostream>
 #include <list>
+#include <mutex>
+#include <queue>
+#include <sstream>
+#include <string>
+#include <thread>
 #include <unordered_map>
-#include <utility>
-#include<sstream>
+#include <vector>
+
+constexpr int PORT = 8080;
+constexpr int WORKER_COUNT = 5;
+constexpr std::size_t CACHE_CAPACITY = 10;
+constexpr std::size_t MAX_PENDING_CLIENTS = 100;
+constexpr std::size_t BUFFER_SIZE = 4096;
 
 using namespace std;
 
-#define MAX_CLIENTS 3
-#define CACHE_CAPACITY 10
+// -------------------- Thread-safe LRU cache --------------------
 
-// Thread-safe LRU Cache
-class LRUCache
-{
-private:
+class LRUCache {
+    using Entry = pair<string, string>;
+
     size_t capacity;
-    list<pair<string, string>> cache_list; // (key, value) pairs
-    unordered_map<string, list<pair<string, string>>::iterator> cache_map;
-    mutable mutex cache_mutex;
+    list<Entry> items; // Most recently used item is at the front.
+    unordered_map<string, list<Entry>::iterator> index;
+    mutex mtx;
 
 public:
-    LRUCache(size_t cap) : capacity(cap) {}
+    explicit LRUCache(size_t cap) : capacity(cap) {}
 
-    // Get value from cache, returns empty string if not found
-    string get(const string &key)
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        auto it = cache_map.find(key);
-        if (it == cache_map.end())
-        {
-            return ""; // Not found
-        }
+    bool get(const string& key, string& value) {
+        lock_guard<mutex> lock(mtx);
 
-        // Move accessed item to front (most recently used)
-        cache_list.splice(cache_list.begin(), cache_list, it->second);
-        return it->second->second;
+        auto it = index.find(key);
+        if (it == index.end()) return false;
+
+        items.splice(items.begin(), items, it->second);
+        value = it->second->second;
+        return true;
     }
 
-    // Check if key exists in cache
-    bool contains(const std::string &key)
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        return cache_map.find(key) != cache_map.end();
-    }
+    void put(const string& key, const string& value) {
+        lock_guard<mutex> lock(mtx);
 
-    // Put value into cache
-    void put(const std::string &key, const std::string &value)
-    {
-        lock_guard<std::mutex> lock(cache_mutex);
-
-        auto it = cache_map.find(key);
-        if (it != cache_map.end())
-        {
-            // Key exists, update value and move to front
+        auto it = index.find(key);
+        if (it != index.end()) {
             it->second->second = value;
-            cache_list.splice(cache_list.begin(), cache_list, it->second);
+            items.splice(items.begin(), items, it->second);
             return;
         }
 
-        // Evict least recently used if at capacity
-        if (cache_list.size() >= capacity)
-        {
-            auto &last = cache_list.back();
-            cache_map.erase(last.first);
-            cache_list.pop_back();
+        if (capacity == 0) return;
+
+        if (items.size() == capacity) {
+            index.erase(items.back().first);
+            items.pop_back();
         }
 
-        // Insert new item at front
-        cache_list.emplace_front(key, value);
-        cache_map[key] = cache_list.begin();
-    }
-
-    size_t size() const
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        return cache_list.size();
-    }
-
-    // Clear the cache
-    void clear()
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        cache_list.clear();
-        cache_map.clear();
+        items.emplace_front(key, value);
+        index[key] = items.begin();
     }
 };
 
-// Global LRU cache instance
-LRUCache response_cache(CACHE_CAPACITY);
+LRUCache responseCache(CACHE_CAPACITY);
 
-// Helper to check if response is cacheable (only cache GET requests with 200 OK)
-bool is_cacheable_response(const string &method, const string &response)
-{
-    if (method != "GET")
-        return false;
+// -------------------- Small HTTP helpers --------------------
+
+string trim(const string& text) {
+    const auto first = text.find_first_not_of(" \t\r\n");
+    if (first == string::npos) return "";
+    const auto last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+string toLower(string text) {
+    transform(text.begin(), text.end(), text.begin(),
+              [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    return text;
+}
+
+struct HttpRequest {
+    string method;
+    string target;
+    string version;
+    string host;
+    string port = "80";
+    string path;
+    string headers;
+};
+
+bool parseRequest(const string& raw, HttpRequest& req) {
+    const size_t lineEnd = raw.find("\r\n");
+    if (lineEnd == string::npos) return false;
+
+    istringstream firstLine(raw.substr(0, lineEnd));
+    if (!(firstLine >> req.method >> req.target >> req.version)) return false;
+
+    const size_t headersEnd = raw.find("\r\n\r\n");
+    if (headersEnd == string::npos) return false;
+    req.headers = raw.substr(lineEnd + 2, headersEnd - (lineEnd + 2));
+
+    // Find Host header without depending on its capitalization.
+    istringstream headerStream(req.headers);
+    string line;
+    while (getline(headerStream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        const size_t colon = line.find(':');
+        if (colon == string::npos) continue;
+
+        if (toLower(trim(line.substr(0, colon))) == "host") {
+            string hostValue = trim(line.substr(colon + 1));
+
+            // This simple proxy supports hostname:port and ordinary hostnames.
+            // IPv6 literals in Host headers should be bracketed, e.g. [::1]:8080.
+            if (!hostValue.empty() && hostValue.front() == '[') {
+                const size_t bracket = hostValue.find(']');
+                if (bracket == string::npos) return false;
+                req.host = hostValue.substr(1, bracket - 1);
+                if (bracket + 1 < hostValue.size() && hostValue[bracket + 1] == ':')
+                    req.port = hostValue.substr(bracket + 2);
+            } else {
+                const size_t hostColon = hostValue.rfind(':');
+                if (hostColon != string::npos && hostValue.find(':') == hostColon) {
+                    req.host = hostValue.substr(0, hostColon);
+                    req.port = hostValue.substr(hostColon + 1);
+                } else {
+                    req.host = hostValue;
+                }
+            }
+            break;
+        }
+    }
+
+    // Proxies commonly receive absolute URLs; convert them to origin-form.
+    if (req.target.rfind("http://", 0) == 0) {
+        const size_t authorityStart = 7;
+        const size_t pathStart = req.target.find('/', authorityStart);
+        const string authority = req.target.substr(
+            authorityStart, pathStart == string::npos ? string::npos : pathStart - authorityStart);
+
+        // Use the URL authority if a Host header was not present.
+        if (req.host.empty()) {
+            const size_t colon = authority.rfind(':');
+            if (colon != string::npos && authority.find(':') == colon) {
+                req.host = authority.substr(0, colon);
+                req.port = authority.substr(colon + 1);
+            } else {
+                req.host = authority;
+            }
+        }
+        req.path = (pathStart == string::npos) ? "/" : req.target.substr(pathStart);
+    } else {
+        req.path = req.target;
+    }
+
+    return !req.host.empty() && !req.port.empty() && !req.path.empty();
+}
+
+int connectToServer(const string& host, const string& port) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;       // Try IPv4 and IPv6.
+    hints.ai_socktype = SOCK_STREAM;   // TCP.
+
+    addrinfo* results = nullptr;
+    const int status = getaddrinfo(host.c_str(), port.c_str(), &hints, &results);
+    if (status != 0) {
+        cerr << "getaddrinfo: " << gai_strerror(status) << '\n';
+        return -1;
+    }
+
+    int remoteFd = -1;
+    for (addrinfo* item = results; item != nullptr; item = item->ai_next) {
+        remoteFd = socket(item->ai_family, item->ai_socktype, item->ai_protocol);
+        if (remoteFd == -1) continue;
+
+        if (connect(remoteFd, item->ai_addr, item->ai_addrlen) == 0) {
+            break;
+        }
+
+        close(remoteFd);
+        remoteFd = -1;
+    }
+
+    freeaddrinfo(results);
+    return remoteFd;
+}
+
+bool sendAll(int fd, const char* data, size_t length) {
+    size_t sentTotal = 0;
+    while (sentTotal < length) {
+        const ssize_t sent = send(fd, data + sentTotal, length - sentTotal, 0);
+        if (sent <= 0) return false;
+        sentTotal += static_cast<size_t>(sent);
+    }
     return true;
 }
-  
- void handle_client(int client_fd)
-{
-    char buffer[1024] = {0};
-    string request;
 
-   while(true)
-    {
-       auto request_data = read(client_fd, buffer, sizeof(buffer));
-        if (request_data < 0)
-        {
-            cout << "Error in read" << std::endl;
-            break;
-        }
+bool isSuccessfulGet(const HttpRequest& req, const string& response) {
+    if (req.method != "GET") return false;
 
-        if (request_data == 0)
-        {
-            // client closed connection
-            break;
-        }
+    const size_t lineEnd = response.find("\r\n");
+    if (lineEnd == string::npos) return false;
 
-        request.append(buffer, request_data);
-        if (request.find("\r\n\r\n") != string::npos)
-        {
-            break;
-        }
-    }
-    cout << "Message from client: " << request << endl;     
-
-       string host_header;
-    size_t host_pos = request.find("Host:");
-    string hostname;
-    string port;
-    
-        if (host_pos != string::npos)
-        {
-            size_t start = host_pos + 6;
-            size_t end = request.find("\r\n", start);
-            host_header = request.substr(start, end - start);
-            auto spilt_index = host_header.find(":");
-            if (spilt_index == string::npos)
-            {
-                hostname = host_header;
-                port = "80";
-            }
-            else
-            {
-                hostname = host_header.substr(0, spilt_index);
-                port = host_header.substr(spilt_index + 1);
-            }
-        }
-
-        istringstream stream(request);
-        string method, path, version;
-
-        stream >> method >> path >> version;
-        cout << "Method: " << method << std::endl;
-        cout << "Path: " << path << std::endl;
-        cout << "Version: " << version << std::endl;
-        cout << "Host Header: " << host_header << std::endl;
-        cout << "Host: " << hostname << std::endl;
-        cout << "Port: " << port << std::endl;
-
-  
-     if (path.find("http://") == 0)
-        {
-            size_t pos = path.find("/", 7);
-            if (pos != string::npos)
-                path = path.substr(pos);
-            else
-                path = "/";
-        }
-// Generate cache key from hostname + path
-    std::string cache_key = hostname + ":" + port + path;
-
-    // Check cache for GET requests
-    if (method == "GET")
-    {
-        string cached_response = response_cache.get(cache_key);
-        if (!cached_response.empty())
-        {
-            cout << "Cache HIT for: " << cache_key << endl;
-            send(client_fd, cached_response.c_str(), cached_response.size(), 0);
-            close(client_fd);
-            return;
-        }
-        cout << "Cache MISS for: " << cache_key << endl;
-    }
-
-
-            string ip_address;
-
-        addrinfo hints{}, *res;
-        hints.ai_family = AF_UNSPEC;     // IPv4 or IPv6
-        hints.ai_socktype = SOCK_STREAM; // TCP
-
-        int status = getaddrinfo(hostname.c_str(), port.c_str(), &hints, &res);
-
-        if (status != 0)
-        {
-            cerr << "getaddrinfo error: " << gai_strerror(status) << endl;
-            return;
-        }
-        char ipstr[INET6_ADDRSTRLEN];
-
-        for (addrinfo *p = res; p != nullptr; p = p->ai_next)
-        {
-
-            void *addr;
-
-            if (p->ai_family == AF_INET)
-            {
-                sockaddr_in *ipv4 = (sockaddr_in *)p->ai_addr;
-                addr = &(ipv4->sin_addr);
-            }
-            else
-            { // AF_INET6
-                sockaddr_in6 *ipv6 = (sockaddr_in6 *)p->ai_addr;
-                addr = &(ipv6->sin6_addr);
-            }
-
-            inet_ntop(p->ai_family, addr, ipstr, sizeof ipstr);
-
-            ip_address = ipstr;
-            cout << "Resolved IP: " << ip_address << endl;
-
-            break; // take first valid one
-        }
-      int remote_socket = -1;
-        addrinfo *p;
-
-        for (p = res; p != nullptr; p = p->ai_next)
-        {
-            remote_socket = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (remote_socket < 0)
-                continue;
-
-            if (connect(remote_socket, p->ai_addr, p->ai_addrlen) == 0)
-                break; // success
-
-            close(remote_socket);
-        }
-
-        if (p == nullptr)
-        {
-            std::cerr << "Failed to connect to any resolved address\n";
-            close(client_fd);
-            freeaddrinfo(res);
-            return;
-        }
-
-        std::cout << "Connected to remote server!" << endl;
-
-        freeaddrinfo(res);
-
-          // 7. Send response
-   string forward_request = method + " " + path + " " + version + "\r\n";
-
-    // Append rest of headers (skip first line)
-   size_t first_line_end = request.find("\r\n");
-    forward_request += request.substr(first_line_end + 2);
-
-    // Send to remote
-    send(remote_socket, forward_request.c_str(), forward_request.size(), 0);
-    bool client_alive = true;
-string full_response; // Buffer to store complete response for caching
-
-       while (true)
-    {
-        ssize_t bytes = read(remote_socket, buffer, sizeof(buffer));
-        if (bytes <= 0)
-            break;
-
-      full_response.append(buffer, bytes);
-      
-       ssize_t total_sent = 0;
-        while (total_sent < bytes)
-        {
-            ssize_t sent = send(client_fd, buffer + total_sent, bytes - total_sent, 0);
-            if (sent <= 0){
-              client_alive = false;
-                break;
-            }
-            total_sent += sent;
-        }
-          if (!client_alive)
-            break;
-    }
-      
-    // Cache the response if it's cacheable
-    if (client_alive && is_cacheable_response(method, full_response))
-    {
-        response_cache.put(cache_key, full_response);
-       cout << "Cached response for: " << cache_key << " (size: " << full_response.size() << " bytes)" <<endl;
-    }
-
-      
-   close(remote_socket);
-    close(client_fd);
+    // Cache only HTTP 200 responses.
+    const string statusLine = response.substr(0, lineEnd);
+    return statusLine.find(" 200 ") != string::npos ||
+           statusLine.size() >= 4 && statusLine.substr(statusLine.size() - 4) == " 200";
 }
-      class ThreadPool
-{
+
+// -------------------- Handle one client connection --------------------
+
+void handleClient(int clientFd) {
+    string rawRequest;
+    char buffer[BUFFER_SIZE];
+
+    // Read until the end of the HTTP headers.
+    while (rawRequest.find("\r\n\r\n") == string::npos) {
+        const ssize_t bytes = recv(clientFd, buffer, sizeof(buffer), 0);
+        if (bytes <= 0) {
+            close(clientFd);
+            return;
+        }
+        rawRequest.append(buffer, static_cast<size_t>(bytes));
+
+        // Keep this small example from accepting unbounded header data.
+        if (rawRequest.size() > 64 * 1024) {
+            close(clientFd);
+            return;
+        }
+    }
+
+    HttpRequest req;
+    if (!parseRequest(rawRequest, req)) {
+        const string error = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        sendAll(clientFd, error.c_str(), error.size());
+        close(clientFd);
+        return;
+    }
+
+    const string cacheKey = req.host + ":" + req.port + req.path;
+    string cachedResponse;
+
+    if (req.method == "GET" && responseCache.get(cacheKey, cachedResponse)) {
+        sendAll(clientFd, cachedResponse.c_str(), cachedResponse.size());
+        close(clientFd);
+        return;
+    }
+
+    const int remoteFd = connectToServer(req.host, req.port);
+    if (remoteFd == -1) {
+        const string error = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        sendAll(clientFd, error.c_str(), error.size());
+        close(clientFd);
+        return;
+    }
+
+    // Forward the request line in origin-form and ask the server to close
+    // after the response, making response reading straightforward.
+    string forwarded = req.method + " " + req.path + " " + req.version + "\r\n";
+    istringstream headerStream(req.headers);
+    string line;
+    bool hasConnectionHeader = false;
+
+    while (getline(headerStream, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t colon = line.find(':');
+        if (colon != string::npos &&
+            toLower(trim(line.substr(0, colon))) == "connection") {
+            hasConnectionHeader = true;
+            continue; // Replace client preference so the upstream closes cleanly.
+        }
+        if (!line.empty()) forwarded += line + "\r\n";
+    }
+
+    (void)hasConnectionHeader;
+    forwarded += "Connection: close\r\n";
+    forwarded += "\r\n";
+
+    if (!sendAll(remoteFd, forwarded.c_str(), forwarded.size())) {
+        close(remoteFd);
+        close(clientFd);
+        return;
+    }
+
+    string fullResponse;
+    bool clientAlive = true;
+
+    // Stream the response to the client while retaining a copy for the cache.
+    while (true) {
+        const ssize_t bytes = recv(remoteFd, buffer, sizeof(buffer), 0);
+        if (bytes <= 0) break;
+
+        fullResponse.append(buffer, static_cast<size_t>(bytes));
+        if (!sendAll(clientFd, buffer, static_cast<size_t>(bytes))) {
+            clientAlive = false;
+            break;
+        }
+    }
+
+    if (clientAlive && isSuccessfulGet(req, fullResponse)) {
+        responseCache.put(cacheKey, fullResponse);
+    }
+
+    close(remoteFd);
+    close(clientFd);
+}
+
+// -------------------- Fixed-size worker thread pool --------------------
+
+class ThreadPool {
+    vector<thread> workers;
+    queue<int> pendingClients;
+    mutex queueMutex;
+    condition_variable queueReady;
+    bool stopping = false;
+
+    void workerLoop() {
+        while (true) {
+            int clientFd;
+
+            {
+                unique_lock<mutex> lock(queueMutex);
+                queueReady.wait(lock, [this] {
+                    return stopping || !pendingClients.empty();
+                });
+
+                if (stopping && pendingClients.empty()) return;
+
+                clientFd = pendingClients.front();
+                pendingClients.pop();
+            }
+
+            handleClient(clientFd);
+        }
+    }
+
 public:
-    vector<std::thread> workers;
-    queue<int> tasks;
-    mutex queue_mutex;
-   condition_variable cv;
-    bool stop;
-    
-    ThreadPool(int num_threads)
-    {
-        this->stop = false;
-        for (int i = 0; i < num_threads; ++i)
-        {
-            workers.emplace_back([this]()
-                                 { worker_run(); });
-        }
-      }
-    void worker_run()
-    {
-        while (true){
-      unique_lock<mutex> lock(queue_mutex);
-            while (tasks.empty() && stop == false)
-            {
-                cv.wait(lock);
-            }
-            if (stop == true and tasks.empty())
-            {
-                return;
-            }
-            int fd = tasks.front();
-            tasks.pop();
-            lock.unlock();
-            handle_client(fd);
+    explicit ThreadPool(size_t count) {
+        for (size_t i = 0; i < count; ++i) {
+            workers.emplace_back([this] { workerLoop(); });
         }
     }
-    void enqueue(int fd)
-    {
+
+    bool enqueue(int clientFd) {
         {
-            unique_lock<mutex> lock(queue_mutex);
-            tasks.push(fd);
+            lock_guard<mutex> lock(queueMutex);
+            if (stopping || pendingClients.size() >= MAX_PENDING_CLIENTS)
+                return false;
+            pendingClients.push(clientFd);
         }
-              cv.notify_one();
+        queueReady.notify_one();
+        return true;
     }
 
-    ~ThreadPool()
-    {
+    ~ThreadPool() {
         {
-           unique_lock<mutex> lock(queue_mutex);
-            stop = true;
+            lock_guard<mutex> lock(queueMutex);
+            stopping = true;
         }
-        cv.notify_all();
+        queueReady.notify_all();
 
-        for (auto &t : workers)
-            t.join();
+        for (thread& worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
+
+        while (!pendingClients.empty()) {
+            close(pendingClients.front());
+            pendingClients.pop();
+        }
     }
 };
-      int main()
-{
-    cout << "Main Function starting" << endl;
 
-    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket < 0)
-    {
-        cout << "Unable to create the socket";
-        exit(1);
+// -------------------- Start proxy server --------------------
+
+int main() {
+    const int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd == -1) {
+        cerr << "Could not create server socket\n";
+        return 1;
     }
-    int opt = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  sockaddr_in address{};
+
+    int reuse = 1;
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY; // Accept any IP
-    address.sin_port = htons(8080);   //port 8080
-    if (bind(server_socket, (struct sockaddr *)&address, sizeof(address)) < 0)
-    {
-        cout << "Unable to bind";
-    }
-  int server_listen = listen(server_socket, MAX_CLIENTS);
-    if (server_listen < 0)
-    {
-        cout << "Unale to listen";
-    }
-  ThreadPool thread_pool(5);
-    while (true)
-    {
-      sockaddr_in client_address{};
-        socklen_t client_len = sizeof(client_address);
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(PORT);
 
-        int server_accept = accept(
-            server_socket,
-            (struct sockaddr *)&client_address,
-            (socklen_t *)&client_len);
-        if (server_accept < 0)
-            continue;
-
-        thread_pool.enqueue(server_accept);
+    if (::bind(serverFd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == -1) {
+        cerr << "bind failed\n";
+        close(serverFd);
+        return 1;
     }
-        
-       
-    close(server_socket);
+
+    if (listen(serverFd, 100) == -1) {
+        cerr << "listen failed\n";
+        close(serverFd);
+        return 1;
+    }
+
+    cout << "HTTP proxy listening on port " << PORT << '\n';
+    ThreadPool pool(WORKER_COUNT);
+
+    while (true) {
+        sockaddr_in clientAddress{};
+        socklen_t clientLength = sizeof(clientAddress);
+
+        const int clientFd = accept(
+            serverFd, reinterpret_cast<sockaddr*>(&clientAddress), &clientLength);
+
+        if (clientFd == -1) continue;
+
+        if (!pool.enqueue(clientFd)) {
+            const string busy =
+                "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+            sendAll(clientFd, busy.c_str(), busy.size());
+            close(clientFd);
+        }
+    }
+
+    close(serverFd);
+    return 0;
 }
